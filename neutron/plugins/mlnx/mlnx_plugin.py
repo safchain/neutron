@@ -32,7 +32,7 @@ from neutron.db import db_base_plugin_v2
 from neutron.db import external_net_db
 from neutron.db import extraroute_db
 from neutron.db import l3_agentschedulers_db
-from neutron.db import l3_gwmode_db
+from neutron.db import l3_hamode_db
 from neutron.db import portbindings_db
 from neutron.db import quota_db  # noqa
 from neutron.db import securitygroups_rpc_base as sg_db_rpc
@@ -54,7 +54,7 @@ LOG = logging.getLogger(__name__)
 class MellanoxEswitchPlugin(db_base_plugin_v2.NeutronDbPluginV2,
                             external_net_db.External_net_db_mixin,
                             extraroute_db.ExtraRoute_db_mixin,
-                            l3_gwmode_db.L3_NAT_db_mixin,
+                            l3_hamode_db.L3_HA_NAT_db_mixin,
                             sg_db_rpc.SecurityGroupServerRpcMixin,
                             l3_agentschedulers_db.L3AgentSchedulerDbMixin,
                             agentschedulers_db.DhcpAgentSchedulerDbMixin,
@@ -83,7 +83,7 @@ class MellanoxEswitchPlugin(db_base_plugin_v2.NeutronDbPluginV2,
                                     "ext-gw-mode", "binding", "quotas",
                                     "security-group", "agent", "extraroute",
                                     "l3_agent_scheduler",
-                                    "dhcp_agent_scheduler"]
+                                    "dhcp_agent_scheduler", "l3-ext-ha-mode"]
 
     @property
     def supported_extension_aliases(self):

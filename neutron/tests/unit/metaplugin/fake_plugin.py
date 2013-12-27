@@ -16,13 +16,13 @@
 
 from neutron.db import db_base_plugin_v2
 from neutron.db import external_net_db
-from neutron.db import l3_gwmode_db
+from neutron.db import l3_hamode_db
 
 
 class Fake1(db_base_plugin_v2.NeutronDbPluginV2,
             external_net_db.External_net_db_mixin,
-            l3_gwmode_db.L3_NAT_db_mixin):
-    supported_extension_aliases = ['external-net', 'router']
+            l3_hamode_db.L3_HA_NAT_db_mixin):
+    supported_extension_aliases = ['external-net', 'router', 'l3-ext-ha-mode']
 
     def fake_func(self):
         return 'fake1'

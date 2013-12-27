@@ -30,7 +30,7 @@ from neutron.db import db_base_plugin_v2
 from neutron.db import dhcp_rpc_base
 from neutron.db import external_net_db
 from neutron.db import extraroute_db
-from neutron.db import l3_gwmode_db
+from neutron.db import l3_hamode_db
 from neutron.db import l3_rpc_base
 from neutron.db import models_v2
 from neutron.db import portbindings_base
@@ -92,13 +92,13 @@ class AgentNotifierApi(proxy.RpcProxy,
 class RyuNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                          external_net_db.External_net_db_mixin,
                          extraroute_db.ExtraRoute_db_mixin,
-                         l3_gwmode_db.L3_NAT_db_mixin,
+                         l3_hamode_db.L3_HA_NAT_db_mixin,
                          sg_db_rpc.SecurityGroupServerRpcMixin,
                          portbindings_base.PortBindingBaseMixin):
 
     _supported_extension_aliases = ["external-net", "router", "ext-gw-mode",
                                     "extraroute", "security-group",
-                                    "binding", "quotas"]
+                                    "binding", "quotas", "l3-ext-ha-mode"]
 
     @property
     def supported_extension_aliases(self):

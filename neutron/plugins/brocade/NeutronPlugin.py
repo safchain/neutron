@@ -42,6 +42,7 @@ from neutron.db import dhcp_rpc_base
 from neutron.db import external_net_db
 from neutron.db import extraroute_db
 from neutron.db import l3_agentschedulers_db
+from neutron.db import l3_hamode_db
 from neutron.db import l3_rpc_base
 from neutron.db import portbindings_base
 from neutron.db import securitygroups_rpc_base as sg_db_rpc
@@ -208,6 +209,7 @@ class AgentNotifierApi(proxy.RpcProxy,
 class BrocadePluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                       external_net_db.External_net_db_mixin,
                       extraroute_db.ExtraRoute_db_mixin,
+                      l3_hamode_db.L3_HA_NAT_db_mixin,
                       sg_db_rpc.SecurityGroupServerRpcMixin,
                       l3_agentschedulers_db.L3AgentSchedulerDbMixin,
                       agentschedulers_db.DhcpAgentSchedulerDbMixin,

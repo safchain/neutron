@@ -27,7 +27,7 @@ from neutron.db import api as qdbapi
 from neutron.db import db_base_plugin_v2
 from neutron.db import extraroute_db
 from neutron.db import l3_agentschedulers_db
-from neutron.db import l3_gwmode_db
+from neutron.db import l3_hamode_db
 from neutron.db import l3_rpc_base
 from neutron.db import model_base
 from neutron.openstack.common import importutils
@@ -50,7 +50,7 @@ class L3RouterPluginRpcCallbacks(l3_rpc_base.L3RpcCallbackMixin):
 
 class L3RouterPlugin(db_base_plugin_v2.CommonDbMixin,
                      extraroute_db.ExtraRoute_db_mixin,
-                     l3_gwmode_db.L3_NAT_db_mixin,
+                     l3_hamode_db.L3_HA_NAT_db_mixin,
                      l3_agentschedulers_db.L3AgentSchedulerDbMixin):
 
     """Implementation of the Neutron L3 Router Service Plugin.
@@ -62,7 +62,8 @@ class L3RouterPlugin(db_base_plugin_v2.CommonDbMixin,
     l3_db.L3_NAT_db_mixin and extraroute_db.ExtraRoute_db_mixin.
     """
     supported_extension_aliases = ["router", "ext-gw-mode",
-                                   "extraroute", "l3_agent_scheduler"]
+                                   "extraroute", "l3_agent_scheduler",
+                                   "l3-ext-ha-mode"]
 
     def __init__(self):
         qdbapi.register_models(base=model_base.BASEV2)

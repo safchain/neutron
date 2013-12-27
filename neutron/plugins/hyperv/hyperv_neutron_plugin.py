@@ -24,7 +24,7 @@ from neutron.common import topics
 from neutron.db import agents_db
 from neutron.db import db_base_plugin_v2
 from neutron.db import external_net_db
-from neutron.db import l3_gwmode_db
+from neutron.db import l3_hamode_db
 from neutron.db import portbindings_base
 from neutron.db import quota_db  # noqa
 from neutron.extensions import portbindings
@@ -147,7 +147,7 @@ class VlanNetworkProvider(BaseNetworkProvider):
 class HyperVNeutronPlugin(agents_db.AgentDbMixin,
                           db_base_plugin_v2.NeutronDbPluginV2,
                           external_net_db.External_net_db_mixin,
-                          l3_gwmode_db.L3_NAT_db_mixin,
+                          l3_hamode_db.L3_HA_NAT_db_mixin,
                           portbindings_base.PortBindingBaseMixin):
 
     # This attribute specifies whether the plugin supports or not
@@ -155,7 +155,8 @@ class HyperVNeutronPlugin(agents_db.AgentDbMixin,
     # is qualified by class
     __native_bulk_support = True
     supported_extension_aliases = ["provider", "external-net", "router",
-                                   "agent", "ext-gw-mode", "binding", "quotas"]
+                                   "agent", "ext-gw-mode", "binding", "quotas",
+                                   "l3-ext-ha-mode"]
 
     def __init__(self, configfile=None):
         self._db = hyperv_db.HyperVPluginDB()
