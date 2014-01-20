@@ -30,8 +30,10 @@ from neutron.db import agents_db
 from neutron.db import l3_agentschedulers_db
 from neutron.extensions import l3 as ext_l3
 from neutron import manager
+from neutron.openstack.common import importutils
 from neutron.openstack.common import timeutils
 from neutron.tests.unit import test_db_plugin
+from neutron.tests.unit import test_extension_l3_ha
 from neutron.tests.unit import test_l3_plugin
 
 HOST = 'my_l3_host'
@@ -72,33 +74,24 @@ class L3SchedulerTestExtensionManager(object):
         return []
 
 
-class L3SchedulerTestCase(l3_agentschedulers_db.L3AgentSchedulerDbMixin,
-                          test_db_plugin.NeutronDbPluginV2TestCase,
-                          test_l3_plugin.L3NatTestCaseMixin):
+class L3SchedulerTestBaseMixin(object):
+    def _register_l3_agents(self, plugin=None):
+        if not plugin:
+            plugin = self.plugin
 
-    def setUp(self):
-        ext_mgr = L3SchedulerTestExtensionManager()
-        super(L3SchedulerTestCase, self).setUp(plugin=DB_PLUGIN_KLASS,
-                                               ext_mgr=ext_mgr)
-
-        self.adminContext = q_context.get_admin_context()
-        self.plugin = manager.NeutronManager.get_plugin()
-        self._register_l3_agents()
-
-    def _register_l3_agents(self):
         callback = agents_db.AgentExtRpcCallback()
         callback.report_state(self.adminContext,
                               agent_state={'agent_state': FIRST_L3_AGENT},
                               time=timeutils.strtime())
-        agent_db = self.plugin.get_agents_db(self.adminContext,
-                                             filters={'host': [HOST]})
+        agent_db = plugin.get_agents_db(self.adminContext,
+                                        filters={'host': [HOST]})
         self.agent_id1 = agent_db[0].id
 
         callback.report_state(self.adminContext,
                               agent_state={'agent_state': SECOND_L3_AGENT},
                               time=timeutils.strtime())
-        agent_db = self.plugin.get_agents_db(self.adminContext,
-                                             filters={'host': [HOST]})
+        agent_db = plugin.get_agents_db(self.adminContext,
+                                        filters={'host': [HOST]})
         self.agent_id2 = agent_db[0].id
 
     def _set_l3_agent_admin_state(self, context, agent_id, state=True):
@@ -123,6 +116,21 @@ class L3SchedulerTestCase(l3_agentschedulers_db.L3AgentSchedulerDbMixin,
             self._remove_external_gateway_from_router(
                 router['router']['id'], subnet['subnet']['network_id'])
             self._delete('routers', router['router']['id'])
+
+
+class L3SchedulerTestCase(l3_agentschedulers_db.L3AgentSchedulerDbMixin,
+                          test_db_plugin.NeutronDbPluginV2TestCase,
+                          test_l3_plugin.L3NatTestCaseMixin,
+                          L3SchedulerTestBaseMixin):
+
+    def setUp(self):
+        ext_mgr = L3SchedulerTestExtensionManager()
+        super(L3SchedulerTestCase, self).setUp(plugin=DB_PLUGIN_KLASS,
+                                               ext_mgr=ext_mgr)
+
+        self.adminContext = q_context.get_admin_context()
+        self.plugin = manager.NeutronManager.get_plugin()
+        self._register_l3_agents()
 
 
 class L3AgentChanceSchedulerTestCase(L3SchedulerTestCase):
@@ -204,3 +212,89 @@ class L3AgentLeastRoutersSchedulerTestCase(L3SchedulerTestCase):
                         agent_id3 = agents[0]['id']
 
                         self.assertNotEqual(agent_id1, agent_id3)
+
+
+class L3AgentHASchedulerTestCase(l3_agentschedulers_db.L3AgentSchedulerDbMixin,
+                                 test_l3_plugin.L3NatTestCaseMixin,
+                                 test_extension_l3_ha.L3HABaseForIntTests,
+                                 L3SchedulerTestBaseMixin):
+
+    def setUp(self):
+        super(L3AgentHASchedulerTestCase, self).setUp()
+
+        self.adminContext = q_context.get_admin_context()
+
+        router_scheduler = ('neutron.scheduler.l3_agent_scheduler.'
+                            'HARouterScheduler')
+        self.plugin = manager.NeutronManager.get_plugin()
+        self.plugin.router_scheduler = importutils.import_object(
+            router_scheduler)
+
+        self._register_l3_agents(plugin=self.plugin)
+
+        self.notify_ha_int_p.stop()
+        self.get_l3_agents_p.stop()
+
+    def tearDown(self):
+        self.notify_ha_int_p.start()
+        self.get_l3_agents_p.start()
+        super(L3AgentHASchedulerTestCase, self).tearDown()
+
+    def test_scheduler_with_ha_enabled(self):
+        with self.router() as r1:
+            agents = self.get_l3_agents_hosting_routers(
+                self.adminContext, [r1['router']['id']],
+                admin_state_up=True)
+            self.assertEqual(2, len(agents))
+
+            sync_data = self.plugin.get_sync_data(self.adminContext,
+                                                  [r1['router']['id']],
+                                                  host=None)
+            self.assertEqual(1, len(sync_data))
+            interfaces = sync_data[0][constants.HA_INTERFACE_KEY]
+            self.assertEqual(2, len(interfaces))
+
+            for agent in agents:
+                sync_data = self.plugin.get_sync_data(self.adminContext,
+                                                      [r1['router']['id']],
+                                                      host=agent.host)
+                self.assertEqual(1, len(sync_data))
+                interfaces = sync_data[0][constants.HA_INTERFACE_KEY]
+                self.assertEqual(1, len(interfaces))
+                self.assertEqual(agent.host, interfaces[0]['agent_host'])
+
+    def test_scheduler_with_ha_enabled_not_enough_agent(self):
+        with self.router() as r1:
+            agents = self.get_l3_agents_hosting_routers(
+                self.adminContext, [r1['router']['id']],
+                admin_state_up=True)
+            self.assertEqual(2, len(agents))
+
+        self._set_l3_agent_admin_state(self.adminContext,
+                                       self.agent_id2, False)
+
+        with self.router() as r1:
+            agents = self.get_l3_agents_hosting_routers(
+                self.adminContext, [r1['router']['id']],
+                admin_state_up=True)
+            self.assertEqual(0, len(agents))
+
+        self._set_l3_agent_admin_state(self.adminContext,
+                                       self.agent_id2, True)
+
+    def test_scheduler_with_ha_disabled(self):
+        cfg.CONF.set_override('l3_ha', False)
+
+        with self.router() as r1:
+            agents = self.get_l3_agents_hosting_routers(
+                self.adminContext, [r1['router']['id']],
+                admin_state_up=True)
+            self.assertEqual(0, len(agents))
+
+        with self.subnet() as subnet:
+            self._set_net_external(subnet['subnet']['network_id'])
+            with self.router_with_ext_gw(name='r1', subnet=subnet) as r1:
+                agents = self.get_l3_agents_hosting_routers(
+                    self.adminContext, [r1['router']['id']],
+                    admin_state_up=True)
+                self.assertEqual(1, len(agents))

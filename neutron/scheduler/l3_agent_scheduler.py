@@ -16,8 +16,10 @@
 #    under the License.
 
 import abc
+import itertools
 import random
 
+from oslo.config import cfg
 import six
 from sqlalchemy.orm import exc
 from sqlalchemy.sql import exists
@@ -190,3 +192,57 @@ class LeastRoutersScheduler(L3Scheduler):
             self.bind_router(context, router_id, chosen_agent)
 
             return chosen_agent
+
+
+class HARouterScheduler(LeastRoutersScheduler):
+    """Randomly allocate a router on many different l3 agents.
+
+    Use min_l3_agents_per_router and max_l3_agents_per_router config parameter
+    in order to schedule the virtual router on many agents. If the l3_ha
+    config parameter is set to false the router will be scheduled by using
+    the LeastRoutersScheduler scheduler algorithm.
+    """
+
+    def schedule(self, plugin, context, router_id):
+        if not cfg.CONF.l3_ha:
+            LOG.warn(_("HARouterScheduled is set in the configuration but "
+                       "l3_ha is not enabled. LeastRoutersScheduler will be "
+                       "used instead"))
+            return super(HARouterScheduler, self).schedule(plugin,
+                                                           context, router_id)
+
+        min_agents = cfg.CONF.min_l3_agents_per_router
+        max_agents = cfg.CONF.max_l3_agents_per_router
+
+        with context.session.begin(subtransactions=True):
+            sync_router = plugin.get_router(context, router_id)
+            candidates = self.get_candidates(plugin, context, sync_router)
+            if not candidates or len(candidates) < min_agents:
+                LOG.error(_("Not enough candidates, in Ha mode at least "
+                            "%s agents are needed"),
+                          cfg.CONF.min_l3_agents_per_router)
+                return
+
+            max_agents = min(max_agents, len(candidates))
+
+            random.shuffle(candidates)
+            chosen_agents = candidates[0:max_agents]
+            bindings = plugin.get_router_port_binding(context, [router_id])
+
+            priority = 1
+            for binding, agent in itertools.izip(bindings, chosen_agents):
+
+                binding.l3_agent_id = agent.id
+                binding.priority = priority
+
+                self.bind_router(context, router_id, agent)
+
+                LOG.debug(_('HA Router %(router_id)s is scheduled to '
+                            'L3 agent %(agent_id)s with a priority of '
+                            '%(priority)s'), {'router_id': sync_router['id'],
+                                              'agent_id': agent.id,
+                                              'priority': priority})
+
+                priority += 1
+
+        return chosen_agents[-1]
