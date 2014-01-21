@@ -40,11 +40,13 @@ class ProcessManager(object):
 
     Note: The manager expects uuid to be in cmdline.
     """
-    def __init__(self, conf, uuid, root_helper='sudo', namespace=None):
+    def __init__(self, conf, uuid, root_helper='sudo', namespace=None,
+                 pids_path=None):
         self.conf = conf
         self.uuid = uuid
         self.root_helper = root_helper
         self.namespace = namespace
+        self.pids_path = pids_path or self.conf.external_pids
 
     def enable(self, cmd_callback):
         if not self.active:
@@ -53,32 +55,46 @@ class ProcessManager(object):
             ip_wrapper = ip_lib.IPWrapper(self.root_helper, self.namespace)
             ip_wrapper.netns.execute(cmd)
 
-    def disable(self):
+    def _kill(self, signal):
         pid = self.pid
-
         if self.active:
-            cmd = ['kill', '-9', pid]
+            cmd = ['kill', '-' + signal, pid]
             utils.execute(cmd, self.root_helper)
         elif pid:
             LOG.debug(_('Process for %(uuid)s pid %(pid)d is stale, ignoring '
-                        'command'), {'uuid': self.uuid, 'pid': pid})
+                        'command %(signal)s'), {'uuid': self.uuid, 'pid': pid,
+                                                'signal': signal})
         else:
             LOG.debug(_('No process started for %s'), self.uuid)
 
-    def get_pid_file_name(self, ensure_pids_dir=False):
+    def restart(self):
+        self._kill('HUP')
+
+    def disable(self, kill=True):
+        if kill:
+            self._kill('9')
+        else:
+            self._kill('15')
+
+        pid_file = self.get_pid_file_name()
+        if os.path.exists(pid_file):
+            os.unlink(self.get_pid_file_name())
+
+    def get_pid_file_name(self, ensure_pids_dir=False, sub_name=None):
         """Returns the file name for a given kind of config file."""
-        pids_dir = os.path.abspath(os.path.normpath(self.conf.external_pids))
+        pids_dir = os.path.abspath(os.path.normpath(self.pids_path))
         if ensure_pids_dir and not os.path.isdir(pids_dir):
             os.makedirs(pids_dir, 0o755)
 
-        return os.path.join(pids_dir, self.uuid + '.pid')
+        pid_file = self.uuid
+        if sub_name:
+            pid_file += '-' + sub_name
+        pid_file += '.pid'
 
-    @property
-    def pid(self):
-        """Last known pid for this external process spawned for this uuid."""
-        file_name = self.get_pid_file_name()
+        return os.path.join(pids_dir, pid_file)
+
+    def _pid_from_file(self, file_name):
         msg = _('Error while reading %s')
-
         try:
             with open(file_name, 'r') as f:
                 return int(f.read())
@@ -89,6 +105,12 @@ class ProcessManager(object):
 
         LOG.debug(msg, file_name)
         return None
+
+    @property
+    def pid(self):
+        """Last known pid for this external process spawned for this uuid."""
+        file_name = self.get_pid_file_name()
+        return self._pid_from_file(file_name)
 
     @property
     def active(self):
