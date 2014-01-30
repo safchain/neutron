@@ -121,6 +121,33 @@ class TestMeteringPlugin(test_db_plugin.NeutronDbPluginV2TestCase,
                     self.mock_fanout.assert_called_with(self.ctx, expected,
                                                         topic=self.topic)
 
+    def test_add_metering_label_shared_rpc_call(self):
+        second_uuid = 'e27fe2df-376e-4ac7-ae13-92f050a21f84'
+        expected = {'args': {'routers': [{'status': 'ACTIVE',
+                                          'name': 'router1',
+                                          'gw_port_id': None,
+                                          'admin_state_up': True,
+                                          'tenant_id': self.tenant_id,
+                                          '_metering_labels': [
+                                              {'rules': [],
+                                               'id': self.uuid},
+                                              {'rules': [],
+                                               'id': second_uuid}],
+                                          'id': self.uuid}]},
+                    'namespace': None,
+                    'method': 'add_metering_label'}
+
+        tenant_id_2 = '8a268a58-1610-4890-87e0-07abb8231206'
+        with self.router(name='router1', tenant_id=self.tenant_id,
+                         set_context=True):
+            with self.metering_label(tenant_id=self.tenant_id,
+                                     set_context=True):
+                self.mock_uuid.return_value = second_uuid
+                with self.metering_label(tenant_id=tenant_id_2, shared=True,
+                                         set_context=True):
+                    self.mock_fanout.assert_called_with(self.ctx, expected,
+                                                        topic=self.topic)
+
     def test_remove_metering_label_rpc_call(self):
         expected = {'args':
                     {'routers': [{'status': 'ACTIVE',

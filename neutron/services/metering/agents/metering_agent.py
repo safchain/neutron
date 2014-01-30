@@ -46,22 +46,22 @@ class MeteringPluginRpc(n_rpc.RpcProxy):
 
     BASE_RPC_API_VERSION = '1.0'
 
-    def __init__(self, host):
+    def __init__(self):
         super(MeteringPluginRpc,
               self).__init__(topic=topics.METERING_AGENT,
                              default_version=self.BASE_RPC_API_VERSION)
 
-    def _get_sync_data_metering(self, context):
+    def _get_sync_data_metering(self, context, host):
         try:
             return self.call(context,
                              self.make_msg('get_sync_data_metering',
-                                           host=self.host),
+                                           host=host),
                              topic=topics.METERING_PLUGIN)
         except Exception:
             LOG.exception(_("Failed synchronizing routers"))
 
 
-class MeteringAgent(MeteringPluginRpc, manager.Manager):
+class MeteringAgent(periodic_task.PeriodicTasks, MeteringPluginRpc):
 
     Opts = [
         cfg.StrOpt('driver',
@@ -75,6 +75,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
     ]
 
     def __init__(self, host, conf=None):
+        super(MeteringAgent, self).__init__()
         self.conf = conf or cfg.CONF
         self._load_drivers()
         self.root_helper = config.get_root_helper(self.conf)
@@ -91,7 +92,6 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
         self.label_tenant_id = {}
         self.routers = {}
         self.metering_infos = {}
-        super(MeteringAgent, self).__init__(host=host)
 
     def _load_drivers(self):
         """Loads plugin-driver from configuration."""
@@ -186,7 +186,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
 
     @periodic_task.periodic_task(run_immediately=True)
     def _sync_routers_task(self, context):
-        routers = self._get_sync_data_metering(self.context)
+        routers = self._get_sync_data_metering(self.context, self.host)
         if not routers:
             return
         self._update_routers(context, routers)
@@ -202,7 +202,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
 
     def routers_updated(self, context, routers=None):
         if not routers:
-            routers = self._get_sync_data_metering(self.context)
+            routers = self._get_sync_data_metering(self.context, self.host)
         if not routers:
             return
         self._update_routers(context, routers)
@@ -236,7 +236,7 @@ class MeteringAgent(MeteringPluginRpc, manager.Manager):
                                    'remove_metering_label')
 
 
-class MeteringAgentWithStateReport(MeteringAgent):
+class MeteringAgentWithStateReport(MeteringAgent, manager.Manager):
 
     def __init__(self, host, conf=None):
         super(MeteringAgentWithStateReport, self).__init__(host=host,

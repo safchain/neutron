@@ -43,6 +43,7 @@ class MeteringPluginDbTestCaseMixin(object):
         data = {'metering_label': {'name': name,
                                    'tenant_id': kwargs.get('tenant_id',
                                                            'test-tenant'),
+                                   'shared': kwargs.get('shared', False),
                                    'description': description}}
         req = self.new_create_request('metering-labels', data,
                                       fmt)
@@ -147,6 +148,17 @@ class MeteringPluginDbTestCase(test_db_plugin.NeutronDbPluginV2TestCase,
         description = 'my metering label'
         keys = [('name', name,), ('description', description)]
         with self.metering_label(name, description) as metering_label:
+            for k, v, in keys:
+                self.assertEqual(metering_label['metering_label'][k], v)
+
+    def test_create_metering_label_shared(self):
+        name = 'my label'
+        description = 'my metering label'
+        shared = True
+        keys = [('name', name,), ('description', description),
+                ('shared', shared)]
+        with self.metering_label(name, description,
+                                 shared=shared) as metering_label:
             for k, v, in keys:
                 self.assertEqual(metering_label['metering_label'][k], v)
 
