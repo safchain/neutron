@@ -20,7 +20,6 @@
 
 
 import mock
-from oslo.config import cfg
 
 from neutron.agent.common import config as agent_config
 from neutron.agent import l3_agent
@@ -41,7 +40,7 @@ class TestVarmourRouter(base.BaseTestCase):
 
     def setUp(self):
         super(TestVarmourRouter, self).setUp()
-        self.conf = cfg.ConfigOpts()
+        self.conf = agent_config.setup_conf()
         self.conf.register_opts(base_config.core_opts)
         self.conf.register_opts(varmour_router.vArmourL3NATAgent.OPTS)
         agent_config.register_interface_driver_opts_helper(self.conf)
@@ -63,6 +62,9 @@ class TestVarmourRouter(base.BaseTestCase):
         self.external_process_p = mock.patch(
             'neutron.agent.linux.external_process.ProcessManager')
         self.external_process = self.external_process_p.start()
+
+        self.makedirs_p = mock.patch('os.makedirs')
+        self.makedirs = self.makedirs_p.start()
 
         self.dvr_cls_p = mock.patch('neutron.agent.linux.interface.NullDriver')
         driver_cls = self.dvr_cls_p.start()

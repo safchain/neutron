@@ -13,6 +13,8 @@
 #    under the License.
 #
 
+import os
+
 import eventlet
 import netaddr
 from oslo.config import cfg
@@ -22,6 +24,7 @@ from neutron.agent.linux import external_process
 from neutron.agent.linux import interface
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import iptables_manager
+from neutron.agent.linux import keepalived
 from neutron.agent.linux import ovs_lib  # noqa
 from neutron.agent import rpc as agent_rpc
 from neutron.common import constants as l3_constants
@@ -47,8 +50,11 @@ LOG = logging.getLogger(__name__)
 NS_PREFIX = 'qrouter-'
 INTERNAL_DEV_PREFIX = 'qr-'
 EXTERNAL_DEV_PREFIX = 'qg-'
+HA_DEV_PREFIX = 'ha-'
 RPC_LOOP_INTERVAL = 1
 FLOATING_IP_CIDR_SUFFIX = '/32'
+HA_VIRTUAL_ROUTER_NAME_PREFIX = 'VR_'
+HA_VIRTUAL_ROUTER_GROUP_PREFIX = 'VG_'
 
 
 class L3PluginApi(proxy.RpcProxy):
@@ -98,11 +104,13 @@ class L3PluginApi(proxy.RpcProxy):
 
 class RouterInfo(object):
 
-    def __init__(self, router_id, root_helper, use_namespaces, router):
+    def __init__(self, router_id, root_helper, use_namespaces, router,
+                 ha_confs_path=None):
         self.router_id = router_id
         self.ex_gw_port = None
         self._snat_enabled = None
         self._snat_action = None
+        self.ha_port = None
         self.internal_ports = []
         self.floating_ips = set()
         self.root_helper = root_helper
@@ -113,7 +121,9 @@ class RouterInfo(object):
             root_helper=root_helper,
             #FIXME(danwent): use_ipv6=True,
             namespace=self.ns_name())
-
+        self.keepalived_manager = None
+        self.keepalived_notifiers = None
+        self.keepalived_spawned = False
         self.routes = []
 
     @property
@@ -145,6 +155,14 @@ class RouterInfo(object):
             snat_callback(self, self._router.get('gw_port'),
                           *args, action=self._snat_action)
         self._snat_action = None
+
+    def is_ha(self):
+        return ((self.router is not None) and
+                self.router.get('ha_vr_id'))
+
+    @property
+    def ha_vr_id(self):
+        return self.router.get('ha_vr_id')
 
 
 class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
@@ -190,6 +208,33 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                    default='$state_path/metadata_proxy',
                    help=_('Location of Metadata Proxy UNIX domain '
                           'socket')),
+        cfg.StrOpt('ha_confs_path',
+                   default='$state_path/ha_confs',
+                   help=_('Location to store keepalived/conntrackd '
+                          'config files')),
+        cfg.StrOpt('ha_vrrp_auth_type',
+                   default='PASS',
+                   help=_('VRRP authentication type AH/PASS')),
+        cfg.StrOpt('ha_vrrp_auth_password',
+                   help=_('VRRP authentication password')),
+        cfg.ListOpt('ha_notification_emails',
+                    help=_('Email accounts that will receive the '
+                           'notification mail')),
+        cfg.StrOpt('ha_notification_from',
+                   help=_('Email to use when processing '
+                          'MAIL FROM: SMTP command')),
+        cfg.StrOpt('ha_smtp_server',
+                   help=_('Remote SMTP server to use for sending '
+                          'mail notification')),
+        cfg.IntOpt('ha_smtp_timeout',
+                   default=10,
+                   help=_('Timeout for SMTP stream processing')),
+        cfg.IntOpt('ha_vrrp_advert_int',
+                   default=2,
+                   help=_('The advertisement interval in seconds')),
+        cfg.IntOpt('ha_garp_master_delay',
+                   help=_('Delay for gratuitous ARP after '
+                          'transition to MASTER')),
     ]
 
     def __init__(self, host, conf=None):
@@ -223,12 +268,19 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         self._delete_stale_namespaces = (self.conf.use_namespaces and
                                          self.conf.router_delete_namespaces)
 
+        self._init_ha_conf_path()
+
         self.rpc_loop = loopingcall.FixedIntervalLoopingCall(
             self._rpc_loop)
         self.rpc_loop.start(interval=RPC_LOOP_INTERVAL)
         super(L3NATAgent, self).__init__(conf=self.conf)
 
         self.target_ex_net_id = None
+
+    def _init_ha_conf_path(self):
+        ha_full_path = os.path.dirname("/%s/" % self.conf.ha_confs_path)
+        if not os.path.isdir(ha_full_path):
+            os.makedirs(ha_full_path, 0o755)
 
     def _check_config_params(self):
         """Check items in configuration files.
@@ -341,7 +393,8 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
 
     def _router_added(self, router_id, router):
         ri = RouterInfo(router_id, self.root_helper,
-                        self.conf.use_namespaces, router)
+                        self.conf.use_namespaces, router,
+                        self.conf.ha_confs_path)
         self.router_info[router_id] = ri
         if self.conf.use_namespaces:
             self._create_router_namespace(ri)
@@ -351,8 +404,12 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             ri.iptables_manager.ipv4['nat'].add_rule(c, r)
         ri.iptables_manager.apply()
         super(L3NATAgent, self).process_router_add(ri)
+
+        if ri.is_ha():
+            self.process_ha_router_added(ri)
+
         if self.conf.enable_metadata_proxy:
-            self._spawn_metadata_proxy(ri.router_id, ri.ns_name())
+            self._spawn_metadata_proxy(ri)
 
     def _router_removed(self, router_id):
         ri = self.router_info.get(router_id)
@@ -360,6 +417,10 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             LOG.warn(_("Info for router %s were not found. "
                        "Skipping router removal"), router_id)
             return
+
+        if ri.is_ha():
+            self.process_ha_router_removed(ri)
+
         ri.router['gw_port'] = None
         ri.router[l3_constants.INTERFACE_KEY] = []
         ri.router[l3_constants.FLOATINGIP_KEY] = []
@@ -374,7 +435,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         del self.router_info[router_id]
         self._destroy_router_namespace(ri.ns_name())
 
-    def _spawn_metadata_proxy(self, router_id, ns_name):
+    def _spawn_metadata_proxy(self, ri):
+        router_id, ns_name = ri.router_id, ri.ns_name()
+
         def callback(pid_file):
             metadata_proxy_socket = cfg.CONF.metadata_proxy_socket
             proxy_cmd = ['neutron-ns-metadata-proxy',
@@ -393,7 +456,23 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             router_id,
             self.root_helper,
             ns_name)
-        pm.enable(callback)
+
+        if ri.is_ha():
+            pid_file = pm.get_pid_file_name(ensure_pids_dir=True)
+            cmd = callback(pid_file)
+
+            ri.keepalived_notifiers.add_notify('master', ' '.join(cmd) + ' &')
+
+            cmd = ['kill', '-9', '$(cat ' + pid_file + ')']
+            ri.keepalived_notifiers.add_notify('backup', ' '.join(cmd))
+            ri.keepalived_notifiers.add_notify('fault', ' '.join(cmd))
+
+            m, b, f = ri.keepalived_notifiers.get_notifiers_path()
+            group = ri.keepalived_manager.config.get_group(
+                HA_VIRTUAL_ROUTER_GROUP_PREFIX + str(ri.ha_vr_id))
+            group.set_notifiers(m, b, f)
+        else:
+            pm.enable(callback)
 
     def _destroy_metadata_proxy(self, router_id, ns_name):
         pm = external_process.ProcessManager(
@@ -412,6 +491,111 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                       port['id'])
         prefixlen = netaddr.IPNetwork(port['subnet']['cidr']).prefixlen
         port['ip_cidr'] = "%s/%s" % (ips[0]['ip_address'], prefixlen)
+
+    def get_ha_device_name(self, port_id):
+        return (HA_DEV_PREFIX + port_id)[:self.driver.DEV_NAME_LEN]
+
+    def ha_network_added(self, ri, network_id, port_id,
+                         internal_cidr, mac_address,
+                         set_address=False):
+        interface_name = self.get_ha_device_name(port_id)
+        if not ip_lib.device_exists(interface_name,
+                                    root_helper=self.root_helper,
+                                    namespace=ri.ns_name()):
+            self.driver.plug(network_id, port_id, interface_name, mac_address,
+                             namespace=ri.ns_name(),
+                             prefix=HA_DEV_PREFIX)
+
+        self.driver.init_l3(interface_name, [internal_cidr],
+                            namespace=ri.ns_name())
+        ip_address = internal_cidr.split('/')[0]
+        self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
+
+    def ha_network_removed(self, ri):
+        interface_name = self.get_ha_device_name(ri.ha_port['id'])
+        if ip_lib.device_exists(interface_name,
+                                root_helper=self.root_helper,
+                                namespace=ri.ns_name()):
+            self.driver.unplug(interface_name, namespace=ri.ns_name(),
+                               prefix=HA_DEV_PREFIX)
+
+    def process_ha_router_added(self, ri):
+        ha_ports = ri.router.get(l3_constants.HA_INTERFACE_KEY)
+        if not ha_ports:
+            LOG.warn(_("Unable to process HA router without ha port"))
+            return
+
+        if len(ha_ports) > 1:
+            LOG.warn(_("A l3 agent can't handle more than once HA port"))
+        ha_port = ha_ports[0]
+
+        self._set_subnet_info(ha_port)
+        self.ha_network_added(ri, ha_port['network_id'], ha_port['id'],
+                              ha_port['ip_cidr'], ha_port['mac_address'])
+        ri.ha_port = ha_port
+
+        self._init_keepalived_manager(ri)
+        self._init_keepalived_notifiers(ri)
+
+    def process_ha_router_removed(self, ri):
+        self._destroy_keepalived(ri)
+        self.ha_network_removed(ri)
+        ri.ha_port = None
+
+    def _init_keepalived_notifiers(self, ri):
+        ri.keepalived_notifiers = (
+            keepalived.KeepalivedNotifyScriptManager(
+                ri.router['id'], conf_path=self.conf.ha_confs_path))
+
+    def _init_keepalived_manager(self, ri):
+        ri.keepalived_manager = keepalived.KeepalivedManager(
+            ri.router['id'],
+            keepalived.KeepalivedConf(),
+            conf_path=self.conf.ha_confs_path,
+            namespace=ri.ns_name(),
+            root_helper=self.root_helper)
+
+        config = ri.keepalived_manager.config
+
+        global_defs = keepalived.KeepalivedGlobaldefs()
+        global_defs.set_smtp_server(self.conf.ha_smtp_server,
+                                    self.conf.ha_smtp_timeout)
+        global_defs.set_email_from(self.conf.ha_notification_from)
+        global_defs.notification_emails = self.conf.ha_notification_emails
+        config.set_global_defs(global_defs)
+
+        group = keepalived.KeepalivedGroup(
+            HA_VIRTUAL_ROUTER_GROUP_PREFIX + str(ri.ha_vr_id))
+
+        interface_name = self.get_ha_device_name(ri.ha_port['id'])
+        instance = keepalived.KeepalivedInstance(
+            HA_VIRTUAL_ROUTER_NAME_PREFIX + str(ri.ha_vr_id),
+            'BACKUP', interface_name, ri.ha_vr_id,
+            ri.ha_port['priority'], nopreempt=True,
+            advert_int=self.conf.ha_vrrp_advert_int,
+            garp_master_delay=self.conf.ha_garp_master_delay)
+        instance.track_interfaces.append(interface_name)
+
+        if self.conf.ha_vrrp_auth_password:
+            # TODO(safchain): use oslo.config types when it will be available
+            # in order to check the validity of ha_vrrp_auth_type
+            instance.set_authentication(self.conf.ha_vrrp_auth_type,
+                                        self.conf.ha_vrrp_auth_password)
+
+        group.add_instance(instance)
+
+        config.add_group(group)
+        config.add_instance(instance)
+
+    def _spawn_keepalived(self, ri):
+        if ri.ha_port:
+            ri.keepalived_manager.spawn_or_restart()
+            ri.keepalived_spawned = True
+
+    def _destroy_keepalived(self, ri):
+        if ri.keepalived_spawned:
+            ri.keepalived_manager.disable()
+            ri.keepalived_spawned = False
 
     def process_router(self, ri):
         ri.iptables_manager.defer_apply_on()
@@ -467,8 +651,13 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                 ri.iptables_manager.defer_apply_off()
                 # Once NAT rules for floating IPs are safely in place
                 # configure their addresses on the external gateway port
-                fip_statuses = self.process_router_floating_ip_addresses(
-                    ri, ex_gw_port)
+                if ri.is_ha():
+                    fip_statuses = (
+                        self.process_ha_router_floating_ip_addresses(
+                            ri, ex_gw_port))
+                else:
+                    fip_statuses = self.process_router_floating_ip_addresses(
+                        ri, ex_gw_port)
         except Exception:
             # TODO(salv-orlando): Less broad catching
             # All floating IPs must be put in error state
@@ -487,6 +676,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         # Update ex_gw_port and enable_snat on the router info cache
         ri.ex_gw_port = ex_gw_port
         ri.enable_snat = ri.router.get('enable_snat')
+
+        if ri.is_ha():
+            self._spawn_keepalived(ri)
 
     def _handle_router_snat_rules(self, ri, ex_gw_port, internal_cidrs,
                                   interface_name, action):
@@ -529,6 +721,82 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
 
         ri.iptables_manager.apply()
 
+    def _add_keepalived_vip(self, ri, ip_cidr, interface):
+        instance = ri.keepalived_manager.config.get_instance(
+            HA_VIRTUAL_ROUTER_NAME_PREFIX + str(ri.ha_vr_id))
+        vip_address = keepalived.KeepalivedVipAddress(ip_cidr, interface)
+
+        vip_addresses = (instance.vip_addresses +
+                         instance.vip_addresses_excluded)
+        vip_addresses.append(vip_address)
+        vip_addresses.sort(key=lambda vip: vip.ip_address)
+
+        # number of vip is limited to 20, so the first one will be used
+        # and the others will be not included in the protocol.
+        vip_address = vip_addresses.pop(0)
+        if vip_address:
+            instance.vip_addresses = [vip_address]
+
+        if vip_addresses:
+            instance.vip_addresses_excluded = vip_addresses
+
+    def _remove_keepalived_vip(self, ri, ip_cidr=None, interface=None):
+        instance = ri.keepalived_manager.config.get_instance(
+            HA_VIRTUAL_ROUTER_NAME_PREFIX + str(ri.ha_vr_id))
+        if interface:
+            instance.remove_vips_vroutes_by_interface(interface)
+        else:
+            instance.remove_vip_by_ip_address(ip_cidr)
+
+        vip_addresses = (instance.vip_addresses +
+                         instance.vip_addresses_excluded)
+        if vip_addresses:
+            vip_addresses.sort(key=lambda vip: vip.ip_address)
+            instance.vip_addresses = [vip_addresses.pop(0)]
+        else:
+            instance.vip_addresses = []
+
+        if vip_addresses:
+            instance.vip_addresses_excluded = vip_addresses
+        else:
+            instance.vip_addresses_excluded = []
+
+    def process_ha_router_floating_ip_addresses(self, ri, ex_gw_port):
+        """Add floating IP as VIP in the keepalived configuration.
+
+        Ensures addresses for existing floating IPs and cleans up
+        those that should not longer be configured.
+        """
+
+        fip_statuses = {}
+        interface_name = self.get_external_device_name(ex_gw_port['id'])
+
+        instance = ri.keepalived_manager.config.get_instance(
+            HA_VIRTUAL_ROUTER_NAME_PREFIX + str(ri.ha_vr_id))
+        existing_cidrs = set([vip.ip_address
+                              for vip in instance.vip_addresses])
+        new_cidrs = set()
+
+        for fip in ri.router.get(l3_constants.FLOATINGIP_KEY, []):
+            fip_ip = fip['floating_ip_address']
+            ip_cidr = str(fip_ip) + FLOATING_IP_CIDR_SUFFIX
+
+            new_cidrs.add(ip_cidr)
+
+            if ip_cidr not in existing_cidrs:
+                self._add_keepalived_vip(ri, ip_cidr, interface_name)
+
+            # Floating IPs are managed by keepalived so should be active
+            # on one node
+            fip_statuses[fip['id']] = (
+                l3_constants.FLOATINGIP_STATUS_ACTIVE)
+
+        # Clean up addresses that no longer belong on the gateway interface.
+        for ip_cidr in existing_cidrs - new_cidrs:
+            if ip_cidr.endswith(FLOATING_IP_CIDR_SUFFIX):
+                self._remove_keepalived_vip(ri, ip_cidr=ip_cidr)
+        return fip_statuses
+
     def process_router_floating_ip_addresses(self, ri, ex_gw_port):
         """Configure IP addresses on router's external gateway interface.
 
@@ -552,7 +820,8 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             if ip_cidr not in existing_cidrs:
                 net = netaddr.IPNetwork(ip_cidr)
                 try:
-                    device.addr.add(net.version, ip_cidr, str(net.broadcast))
+                    device.addr.add(net.version, ip_cidr,
+                                    str(net.broadcast))
                 except (processutils.UnknownArgumentError,
                         processutils.ProcessExecutionError):
                     # any exception occurred here should cause the floating IP
@@ -564,8 +833,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                     continue
                 # As GARP is processed in a distinct thread the call below
                 # won't raise an exception to be handled.
-                self._send_gratuitous_arp_packet(
-                    ri, interface_name, fip_ip)
+                if not ri.is_ha():
+                    self._send_gratuitous_arp_packet(ri, interface_name,
+                                                     fip_ip)
             fip_statuses[fip['id']] = (
                 l3_constants.FLOATINGIP_STATUS_ACTIVE)
 
@@ -618,21 +888,35 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         preserve_ips = [ip['floating_ip_address'] + FLOATING_IP_CIDR_SUFFIX
                         for ip in floating_ips]
 
-        self.driver.init_l3(interface_name, [ex_gw_port['ip_cidr']],
-                            namespace=ri.ns_name(),
-                            preserve_ips=preserve_ips)
-        ip_address = ex_gw_port['ip_cidr'].split('/')[0]
-        self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
+        if ri.is_ha():
+            self._add_keepalived_vip(ri, ex_gw_port['ip_cidr'],
+                                     interface_name)
+        else:
+            self.driver.init_l3(interface_name, [ex_gw_port['ip_cidr']],
+                                namespace=ri.ns_name(),
+                                preserve_ips=preserve_ips)
+            ip_address = ex_gw_port['ip_cidr'].split('/')[0]
+            self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
 
         gw_ip = ex_gw_port['subnet']['gateway_ip']
         if ex_gw_port['subnet']['gateway_ip']:
-            cmd = ['route', 'add', 'default', 'gw', gw_ip]
-            ip_wrapper = ip_lib.IPWrapper(self.root_helper,
-                                          namespace=ri.ns_name())
-            ip_wrapper.netns.execute(cmd, check_exit_code=False)
+            if ri.is_ha():
+                instance = ri.keepalived_manager.config.get_instance(
+                    HA_VIRTUAL_ROUTER_NAME_PREFIX + str(ri.ha_vr_id))
+                vroute = keepalived.KeepalivedVirtualRoute(
+                    '0.0.0.0/0', gw_ip, interface_name)
+                instance.virtual_routes.append(vroute)
+            else:
+                cmd = ['route', 'add', 'default', 'gw', gw_ip]
+                ip_wrapper = ip_lib.IPWrapper(self.root_helper,
+                                              namespace=ri.ns_name())
+                ip_wrapper.netns.execute(cmd, check_exit_code=False)
 
     def external_gateway_removed(self, ri, ex_gw_port,
                                  interface_name, internal_cidrs):
+
+        if ri.is_ha():
+            self._remove_keepalived_vip(ri, interface=interface_name)
 
         self.driver.unplug(interface_name,
                            bridge=self.conf.external_network_bridge,
@@ -675,16 +959,23 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                              namespace=ri.ns_name(),
                              prefix=INTERNAL_DEV_PREFIX)
 
-        self.driver.init_l3(interface_name, [internal_cidr],
-                            namespace=ri.ns_name())
         ip_address = internal_cidr.split('/')[0]
-        self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
+
+        if ri.is_ha():
+            self._add_keepalived_vip(ri, internal_cidr, interface_name)
+        else:
+            self.driver.init_l3(interface_name, [internal_cidr],
+                                namespace=ri.ns_name())
+            self._send_gratuitous_arp_packet(ri, interface_name, ip_address)
 
     def internal_network_removed(self, ri, port_id, internal_cidr):
         interface_name = self.get_internal_device_name(port_id)
         if ip_lib.device_exists(interface_name,
                                 root_helper=self.root_helper,
                                 namespace=ri.ns_name()):
+            if ri.is_ha():
+                self._remove_keepalived_vip(ri, ip_cidr=internal_cidr)
+
             self.driver.unplug(interface_name, namespace=ri.ns_name(),
                                prefix=INTERNAL_DEV_PREFIX)
 
@@ -802,6 +1093,20 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
     def _router_ids(self):
         if not self.conf.use_namespaces:
             return [self.conf.router_id]
+
+    @periodic_task.periodic_task
+    @lockutils.synchronized('l3-agent', 'neutron-')
+    def _check_keepalived_alive(self, context):
+        router_infos = self.router_info.values()
+        for ri in router_infos:
+            if ri.ha_port:
+                if not ri.keepalived_spawned:
+                    continue
+
+                if not ri.keepalived_manager.pm.active:
+                    LOG.warn(_('Keepalived instance for %s seems to be dead, '
+                               'tryng restart it'), ri.router['id'])
+                    self._spawn_keepalived(ri)
 
     @periodic_task.periodic_task
     @lockutils.synchronized('l3-agent', 'neutron-')
