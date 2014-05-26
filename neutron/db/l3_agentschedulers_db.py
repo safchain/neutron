@@ -21,6 +21,7 @@ from sqlalchemy.orm import exc
 from sqlalchemy.orm import joinedload
 
 from neutron.common import constants
+from neutron.common import utils
 from neutron.db import agents_db
 from neutron.db import agentschedulers_db
 from neutron.db import model_base
@@ -170,8 +171,13 @@ class L3AgentSchedulerDbMixin(l3agentscheduler.L3AgentSchedulerPluginBase,
                 RouterL3AgentBinding.router_id.in_(router_ids))
         router_ids = [item[0] for item in query]
         if router_ids:
-            return self.get_sync_data(context, router_ids=router_ids,
-                                      active=True)
+            if utils.is_extension_supported(self,
+                                            constants.L3_HA_MODE_EXT_ALIAS):
+                return self.get_sync_data(context, host, router_ids=router_ids,
+                                          active=True)
+            else:
+                return self.get_sync_data(context, router_ids=router_ids,
+                                          active=True)
         else:
             return []
 

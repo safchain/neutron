@@ -29,6 +29,7 @@ FLOATINGIP_STATUS_ACTIVE = 'ACTIVE'
 FLOATINGIP_STATUS_DOWN = 'DOWN'
 FLOATINGIP_STATUS_ERROR = 'ERROR'
 
+DEVICE_OWNER_ROUTER_HA_INTF = "network:router_ha_interface"
 DEVICE_OWNER_ROUTER_INTF = "network:router_interface"
 DEVICE_OWNER_ROUTER_GW = "network:router_gateway"
 DEVICE_OWNER_FLOATINGIP = "network:floatingip"
@@ -38,6 +39,8 @@ DEVICE_ID_RESERVED_DHCP_PORT = "reserved_dhcp_port"
 
 FLOATINGIP_KEY = '_floatingips'
 INTERFACE_KEY = '_interfaces'
+HA_INTERFACE_KEY = '_ha_interfaces'
+HA_ROUTER_STATE_KEY = '_ha_state'
 METERING_LABEL_KEY = '_metering_labels'
 
 IPv4 = 'IPv4'
@@ -93,6 +96,7 @@ PORT_BINDING_EXT_ALIAS = 'binding'
 L3_AGENT_SCHEDULER_EXT_ALIAS = 'l3_agent_scheduler'
 DHCP_AGENT_SCHEDULER_EXT_ALIAS = 'dhcp_agent_scheduler'
 LBAAS_AGENT_SCHEDULER_EXT_ALIAS = 'lbaas_agent_scheduler'
+L3_HA_MODE_EXT_ALIAS = 'l3-ha'
 
 # Protocol names and numbers for Security Groups/Firewalls
 PROTO_NAME_TCP = 'tcp'

@@ -1908,14 +1908,15 @@ class L3BaseForIntTests(test_db_plugin.NeutronDbPluginV2TestCase):
 
 class L3BaseForSepTests(test_db_plugin.NeutronDbPluginV2TestCase):
 
-    def setUp(self, plugin=None, ext_mgr=None):
+    def setUp(self, plugin=None, ext_mgr=None, service_plugins=None):
         # the plugin without L3 support
         if not plugin:
             plugin = 'neutron.tests.unit.test_l3_plugin.TestNoL3NatPlugin'
         # the L3 service plugin
-        l3_plugin = ('neutron.tests.unit.test_l3_plugin.'
-                     'TestL3NatServicePlugin')
-        service_plugins = {'l3_plugin_name': l3_plugin}
+        if not service_plugins:
+            l3_plugin = ('neutron.tests.unit.test_l3_plugin.'
+                         'TestL3NatServicePlugin')
+            service_plugins = {'l3_plugin_name': l3_plugin}
 
         # for these tests we need to enable overlapping ips
         cfg.CONF.set_default('allow_overlapping_ips', True)

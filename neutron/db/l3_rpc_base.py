@@ -74,6 +74,9 @@ class L3RpcCallbackMixin(object):
             for interface in router.get(constants.INTERFACE_KEY, []):
                 self._ensure_host_set_on_port(context, plugin, host,
                                               interface)
+            for interface in router.get(constants.HA_INTERFACE_KEY, []):
+                self._ensure_host_set_on_port(context, plugin, host,
+                                              interface)
 
     def _ensure_host_set_on_port(self, context, plugin, host, port):
         if (port and
