@@ -71,6 +71,16 @@ class BaseOVS(object):
                 if not check_error:
                     ctxt.reraise = False
 
+    def run_dpctl(self, args, check_error=False):
+        full_args = ["ovs-dpctl", "--timeout=2"] + args
+        try:
+            return utils.execute(full_args, root_helper=self.root_helper)
+        except Exception as e:
+            LOG.error(_("Unable to execute %(cmd)s. Exception: %(exception)s"),
+                      {'cmd': full_args, 'exception': e})
+            if check_error:
+                raise
+
     def add_bridge(self, bridge_name):
         self.run_vsctl(["--", "--may-exist", "add-br", bridge_name])
         return OVSBridge(bridge_name, self.root_helper)

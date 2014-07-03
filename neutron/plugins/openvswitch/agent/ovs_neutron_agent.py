@@ -27,6 +27,7 @@ from oslo.config import cfg
 from six import moves
 
 from neutron.agent import l2population_rpc
+from neutron.agent.port_metering import port_metering
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import ovs_lib
 from neutron.agent.linux import polling
@@ -217,6 +218,15 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
         # Initialize iteration counter
         self.iter_num = 0
         self.run_daemon_loop = True
+
+        self.ip = ip_lib.IPWrapper(root_helper)
+
+        # port traffic counters
+        if cfg.CONF.PORT_METERING.enable_port_metering:
+            driver = ('neutron.agent.port_metering.drivers.ovs_driver.'
+                      'OvsPortMeteringDriver')
+            self.port_metering = port_metering.PortMetering(self.context,
+                                                            driver)
 
     def _check_arp_responder_support(self):
         '''Check if OVS supports to modify ARP headers.
@@ -659,7 +669,7 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
 
     def port_bound(self, port, net_uuid,
                    network_type, physical_network, segmentation_id,
-                   ovs_restarted):
+                   ovs_restarted, device_id, device_owner, tenant_id):
         '''Bind port to net_uuid/lsw_id and install flow for inbound traffic
         to vm.
 
@@ -682,6 +692,11 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
                                          str(lvm.vlan))
             if port.ofport != -1:
                 self.int_br.delete_flows(in_port=port.ofport)
+
+        if self.port_metering:
+            self.port_metering.add_port(tenant_id, net_uuid,
+                                        device_id, device_owner,
+                                        port.port_name, port.vif_id)
 
     def port_unbound(self, vif_id, net_uuid=None):
         '''Unbind port.
@@ -1033,7 +1048,8 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
 
     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
                        physical_network, segmentation_id, admin_state_up,
-                       ovs_restarted):
+                       ovs_restarted, device_id=None, device_owner=None,
+                       tenant_id=None):
         # When this function is called for a port, the port should have
         # an OVS ofport configured, as only these ports were considered
         # for being treated. If that does not happen, it is a potential
@@ -1045,7 +1061,8 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
             if admin_state_up:
                 self.port_bound(vif_port, network_id, network_type,
                                 physical_network, segmentation_id,
-                                ovs_restarted)
+                                ovs_restarted, device_id, device_owner,
+                                tenant_id)
             else:
                 self.port_dead(vif_port)
         else:
@@ -1137,7 +1154,10 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
                                     details['physical_network'],
                                     details['segmentation_id'],
                                     details['admin_state_up'],
-                                    ovs_restarted)
+                                    ovs_restarted,
+                                    details['device_id'],
+                                    details['device_owner'],
+                                    details['tenant_id'])
                 # update plugin about port status
                 if details.get('admin_state_up'):
                     LOG.debug(_("Setting status for %s to UP"), device)
@@ -1182,6 +1202,10 @@ class OVSNeutronAgent(n_rpc.RpcCallback,
         self.sg_agent.remove_devices_filter(devices)
         for device in devices:
             LOG.info(_("Attachment %s removed"), device)
+
+            if self.port_metering:
+                self.port_metering.remove_port(device)
+
             try:
                 self.plugin_rpc.update_device_down(self.context,
                                                    device,
