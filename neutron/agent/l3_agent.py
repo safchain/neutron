@@ -986,12 +986,15 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
         try:
             if ex_gw_port:
                 existing_floating_ips = ri.floating_ips
-                self.process_router_floating_ip_nat_rules(ri)
+                floating_ips = ri.router.get(l3_constants.FLOATINGIP_KEY, [])
+                if ri.router['distributed']:
+                    self._create_dvr_fip_interfaces(ri, ex_gw_port, floating_ips)
+                self.process_router_floating_ip_nat_rules(ri, ex_gw_port)
                 ri.iptables_manager.defer_apply_off()
                 # Once NAT rules for floating IPs are safely in place
                 # configure their addresses on the external gateway port
                 fip_statuses = self.process_router_floating_ip_addresses(
-                    ri, ex_gw_port)
+                    ri, ex_gw_port, floating_ips)
         except Exception:
             # TODO(salv-orlando): Less broad catching
             # All floating IPs must be put in error state
@@ -1077,7 +1080,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
             ri.iptables_manager.ipv4['nat'].add_rule(*rule)
         ri.iptables_manager.apply()
 
-    def process_router_floating_ip_nat_rules(self, ri):
+    def process_router_floating_ip_nat_rules(self, ri, ex_gw_port):
         """Configure NAT rules for the router's floating IPs.
 
         Configures iptables rules for the floating ips of the given router
@@ -1085,34 +1088,42 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
         # Clear out all iptables rules for floating ips
         ri.iptables_manager.ipv4['nat'].clear_rules_by_tag('floating_ip')
 
+        interface_name = self._get_external_device_interface_name(ri,
+                                                                  ex_gw_port)
+        if not interface_name:
+            LOG.error(_("Unable to find the GW interface name for port: %s"),
+                      ex_gw_port['id'])
+            return
         floating_ips = self.get_floating_ips(ri)
         # Loop once to ensure that floating ips are configured.
         for fip in floating_ips:
             # Rebuild iptables rules for the floating ip.
             fixed = fip['fixed_ip_address']
             fip_ip = fip['floating_ip_address']
-            for chain, rule in self.floating_forward_rules(fip_ip, fixed):
+            for chain, rule in self.floating_forward_rules(fip_ip, fixed,
+                                                           interface_name):
                 ri.iptables_manager.ipv4['nat'].add_rule(chain, rule,
                                                          tag='floating_ip')
 
         ri.iptables_manager.apply()
 
-    def _get_external_device_interface_name(self, ri, ex_gw_port,
-                                            floating_ips):
-        if ri.router['distributed']:
-            # filter out only FIPs for this host/agent
-            floating_ips = [i for i in floating_ips if i['host'] == self.host]
-            if floating_ips and self.agent_gateway_port is None:
-                self._create_agent_gateway_port(ri, floating_ips[0]
-                                                ['floating_network_id'])
+    def _create_dvr_fip_interfaces(self, ri, ex_gw_port, floating_ips):
+        # filter out only FIPs for this host/agent
+        floating_ips = [i for i in floating_ips if i['host'] == self.host]
+        if floating_ips and self.agent_gateway_port is None:
+            self._create_agent_gateway_port(ri, floating_ips[0]
+                                            ['floating_network_id'])
 
+        if self.agent_gateway_port:
+            if floating_ips and ri.dist_fip_count == 0:
+                self.create_rtr_2_fip_link(ri, floating_ips[0]
+                                           ['floating_network_id'])
+
+    def _get_external_device_interface_name(self, ri, ex_gw_port):
+        if ri.router['distributed']:
             if self.agent_gateway_port:
-                if floating_ips and ri.dist_fip_count == 0:
-                    self.create_rtr_2_fip_link(ri, floating_ips[0]
-                                               ['floating_network_id'])
                 return self.get_rtr_int_device_name(ri.router_id)
             else:
-                # there are no fips or agent port, no work to do
                 return None
 
         return self.get_external_device_name(ex_gw_port['id'])
@@ -1157,7 +1168,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
             if ri.router['distributed']:
                 self.floating_ip_removed_dist(ri, ip_cidr)
 
-    def process_router_floating_ip_addresses(self, ri, ex_gw_port):
+    def process_router_floating_ip_addresses(self, ri, ex_gw_port, floating_ips):
         """Configure IP addresses on router's external gateway interface.
 
         Ensures addresses for existing floating IPs and cleans up
@@ -1165,9 +1176,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
         """
 
         fip_statuses = {}
-        floating_ips = ri.router.get(l3_constants.FLOATINGIP_KEY, [])
-        interface_name = self._get_external_device_interface_name(
-            ri, ex_gw_port, floating_ips)
+        interface_name = self._get_external_device_interface_name(ri, ex_gw_port)
         if interface_name is None:
             return fip_statuses
 
@@ -1704,13 +1713,13 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback,
         if self.agent_fip_count == 0:
             self._destroy_fip_namespace(fip_ns_name)
 
-    def floating_forward_rules(self, floating_ip, fixed_ip):
-        return [('PREROUTING', '-d %s -j DNAT --to %s' %
-                 (floating_ip, fixed_ip)),
-                ('OUTPUT', '-d %s -j DNAT --to %s' %
-                 (floating_ip, fixed_ip)),
-                ('float-snat', '-s %s -j SNAT --to %s' %
-                 (fixed_ip, floating_ip))]
+    def floating_forward_rules(self, floating_ip, fixed_ip, interface_name):
+        return [('PREROUTING', '-i %s -d %s -j DNAT --to %s' %
+                 (interface_name, floating_ip, fixed_ip)),
+                ('OUTPUT', '-o %s -d %s -j DNAT --to %s' %
+                 (interface_name, floating_ip, fixed_ip)),
+                ('float-snat', '-o %s -s %s -j SNAT --to %s' %
+                 (interface_name, fixed_ip, floating_ip))]
 
     def router_deleted(self, context, router_id):
         """Deal with router deletion RPC message."""

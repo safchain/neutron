@@ -981,13 +981,15 @@ class TestBasicRouterOperations(base.BaseTestCase):
             {'id': fake_fip_id,
              'floating_ip_address': '8.8.8.8',
              'fixed_ip_address': '7.7.7.7',
-             'port_id': _uuid()}]}
+             'port_id': _uuid(),
+             'host': HOSTNAME}]}
         agent.process_router(ri)
         ex_gw_port = agent._get_ex_gw_port(ri)
         agent.process_router_floating_ip_addresses.assert_called_with(
-            ri, ex_gw_port)
+            ri, ex_gw_port, [])
         agent.process_router_floating_ip_addresses.reset_mock()
-        agent.process_router_floating_ip_nat_rules.assert_called_with(ri)
+        agent.process_router_floating_ip_nat_rules.assert_called_with(
+            ri, ex_gw_port)
         agent.process_router_floating_ip_nat_rules.reset_mock()
         agent.external_gateway_added.reset_mock()
 
@@ -999,9 +1001,10 @@ class TestBasicRouterOperations(base.BaseTestCase):
         agent.process_router(ri)
         ex_gw_port = agent._get_ex_gw_port(ri)
         agent.process_router_floating_ip_addresses.assert_called_with(
-            ri, ex_gw_port)
+            ri, ex_gw_port, fake_floatingips2['floatingips'])
         agent.process_router_floating_ip_addresses.reset_mock()
-        agent.process_router_floating_ip_nat_rules.assert_called_with(ri)
+        agent.process_router_floating_ip_nat_rules.assert_called_with(
+            ri, ex_gw_port)
         agent.process_router_floating_ip_nat_rules.reset_mock()
         self.assertEqual(agent.external_gateway_added.call_count, 0)
         self.assertEqual(agent.external_gateway_updated.call_count, 0)
@@ -1027,9 +1030,10 @@ class TestBasicRouterOperations(base.BaseTestCase):
         agent.process_router(ri)
         ex_gw_port = agent._get_ex_gw_port(ri)
         agent.process_router_floating_ip_addresses.assert_called_with(
-            ri, ex_gw_port)
+            ri, ex_gw_port, [])
         agent.process_router_floating_ip_addresses.reset_mock()
-        agent.process_router_floating_ip_nat_rules.assert_called_with(ri)
+        agent.process_router_floating_ip_nat_rules.assert_called_with(
+            ri, ex_gw_port)
         agent.process_router_floating_ip_nat_rules.reset_mock()
 
         # now no ports so state is torn down
@@ -1102,10 +1106,12 @@ vrrp_instance VR_1 {
         IPDevice.return_value = device = mock.Mock()
         device.addr.list.return_value = []
         ri.iptables_manager.ipv4['nat'] = mock.MagicMock()
+        ex_gw_port = {'id': _uuid()}
 
         with mock.patch.object(l3_agent.LinkLocalAllocator, '_write'):
+            agent._create_dvr_fip_interfaces(ri, ex_gw_port, floating_ips)
             fip_statuses = agent.process_router_floating_ip_addresses(
-                ri, {'id': _uuid()})
+                ri, ex_gw_port, floating_ips)
         self.assertEqual({fip_id: l3_constants.FLOATINGIP_STATUS_ACTIVE},
                          fip_statuses)
         device.addr.add.assert_called_once_with(4, '15.1.2.3/32', '15.1.2.3')
@@ -1123,20 +1129,42 @@ vrrp_instance VR_1 {
 
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
-        agent.process_router_floating_ip_nat_rules(ri)
+        ex_gw_port = {'id': _uuid()}
+        interface_name = agent._get_external_device_interface_name(
+            ri, ex_gw_port)
+        agent.process_router_floating_ip_nat_rules(ri, ex_gw_port)
 
         nat = ri.iptables_manager.ipv4['nat']
         nat.clear_rules_by_tag.assert_called_once_with('floating_ip')
-        rules = agent.floating_forward_rules('15.1.2.3', '192.168.0.1')
+        rules = agent.floating_forward_rules('15.1.2.3', '192.168.0.1',
+                                             interface_name)
         for chain, rule in rules:
             nat.add_rule.assert_any_call(chain, rule, tag='floating_ip')
+
+    def test_floating_forward_rules(self):
+        agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
+        ri = mock.MagicMock()
+        ri.router['distributed'].__nonzero__ = lambda self: False
+        interface_name = agent._get_external_device_interface_name(
+            ri, {'id': _uuid()})
+        rules = agent.floating_forward_rules('192.168.0.1',
+                                             '192.168.0.1',
+                                             interface_name)
+        expected = [('PREROUTING', '-i %s -d 192.168.0.1 '
+                     '-j DNAT --to 192.168.0.1' % interface_name),
+                    ('OUTPUT', '-o %s -d 192.168.0.1 '
+                     '-j DNAT --to 192.168.0.1' % interface_name),
+                    ('float-snat', '-o %s -s 192.168.0.1 '
+                     '-j SNAT --to 192.168.0.1' % interface_name)]
+        self.assertEquals(expected, rules)
 
     def test_process_router_cent_floating_ip_add(self):
         fake_floatingips = {'floatingips': [
             {'id': _uuid(),
              'floating_ip_address': '15.1.2.3',
              'fixed_ip_address': '192.168.0.1',
-             'port_id': _uuid()}]}
+             'port_id': _uuid(),
+             'host': HOSTNAME}]}
 
         router = prepare_router_data(enable_snat=True)
         router[l3_constants.FLOATINGIP_KEY] = fake_floatingips['floatingips']
@@ -1188,7 +1216,7 @@ vrrp_instance VR_1 {
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
         fip_statuses = agent.process_router_floating_ip_addresses(
-            ri, {'id': _uuid()})
+            ri, {'id': _uuid()}, [])
         self.assertEqual({}, fip_statuses)
         device.addr.delete.assert_called_once_with(4, '15.1.2.3/32')
         self.mock_driver.delete_conntrack_state.assert_called_once_with(
@@ -1202,7 +1230,7 @@ vrrp_instance VR_1 {
 
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
-        agent.process_router_floating_ip_nat_rules(ri)
+        agent.process_router_floating_ip_nat_rules(ri, {'id': _uuid()})
 
         nat = ri.iptables_manager.ipv4['nat']
         nat = ri.iptables_manager.ipv4['nat`']
@@ -1227,7 +1255,7 @@ vrrp_instance VR_1 {
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
         fip_statuses = agent.process_router_floating_ip_addresses(
-            ri, {'id': _uuid()})
+            ri, {'id': _uuid()}, [fip])
         self.assertEqual({fip_id: l3_constants.FLOATINGIP_STATUS_ACTIVE},
                          fip_statuses)
 
@@ -1250,7 +1278,7 @@ vrrp_instance VR_1 {
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
         fip_statuses = agent.process_router_floating_ip_addresses(
-            ri, {'id': _uuid()})
+            ri, {'id': _uuid()}, [fip])
 
         self.assertIsNone(fip_statuses.get(fip_id))
 
@@ -1273,7 +1301,7 @@ vrrp_instance VR_1 {
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
 
         fip_statuses = agent.process_router_floating_ip_addresses(
-            ri, {'id': _uuid()})
+            ri, {'id': _uuid()}, [fip])
 
         self.assertEqual({fip_id: l3_constants.FLOATINGIP_STATUS_ERROR},
                          fip_statuses)
